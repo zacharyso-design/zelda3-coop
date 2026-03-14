@@ -11,6 +11,11 @@
 #include "util.h"
 #include "audio.h"
 #include "assets.h"
+#ifdef ZELDA3_MULTIPLAYER
+#include "player.h"
+#include "player_oam.h"
+#include "sprite.h"
+#endif
 ZeldaEnv g_zenv;
 uint8 g_ram[131072];
 
@@ -262,6 +267,301 @@ static void ZeldaRunGameLoop() {
   nmi_boolean = 0;
 }
 
+#ifdef ZELDA3_MULTIPLAYER
+static bool g_mp_initialized = false;
+static uint16 g_p2_input_this_frame;
+static void Multiplayer_UpdateCamera(void);
+static void Multiplayer_CheckSpriteDamageToP2(void);
+static void Multiplayer_DrawP2Hud(void);
+static void Multiplayer_HandleP2Death(void);
+static void Multiplayer_WarpP2OnTransition(void);
+
+// Simple sprite-vs-P2 damage check. cur_player must be P2 when called.
+static void Multiplayer_CheckSpriteDamageToP2(void) {
+  if (link_disable_sprite_damage || countdown_for_blink)
+    return;
+  for (int k = 15; k >= 0; k--) {
+    if (sprite_state[k] != 9)  // 9 = active
+      continue;
+    if (sprite_floor[k] != link_is_on_lower_level)
+      continue;
+    if (sprite_hit_timer[k])
+      continue;
+    // Simple bounding box check
+    int dx = (int)link_x_coord - (int)(sprite_x_lo[k] | (sprite_x_hi[k] << 8));
+    int dy = (int)link_y_coord - (int)(sprite_y_lo[k] | (sprite_y_hi[k] << 8));
+    if (dx > -16 && dx < 16 && dy > -16 && dy < 16) {
+      // Apply damage to P2
+      link_give_damage = kSpriteInit_BumpDamage[sprite_type[k]];
+      if (link_give_damage == 0)
+        link_give_damage = 2;  // minimum damage
+      break;  // only one sprite damages per frame
+    }
+  }
+}
+
+// Process P2's NMI input (writes to per-player joypad globals via cur_player macros)
+static void Multiplayer_ProcessP2Input(uint16 joypad_input) {
+  uint16 both = joypad_input;
+  uint16 reversed = 0;
+  for (int i = 0; i < 16; i++, both >>= 1)
+    reversed = reversed * 2 + (both & 1);
+  uint8 r0 = reversed;
+  uint8 r1 = reversed >> 8;
+
+  joypad1L_last = r0;
+  filtered_joypad_L = (r0 ^ joypad1L_last2) & r0;
+  joypad1L_last2 = r0;
+
+  joypad1H_last = r1;
+  filtered_joypad_H = (r1 ^ joypad1H_last2) & r1;
+  joypad1H_last2 = r1;
+}
+
+// Initialize P2 when first entering gameplay (module 7 = dungeon, 9 = overworld)
+static void Multiplayer_InitIfNeeded(void) {
+  if (g_mp_initialized) return;
+  if (main_module_index != 7 && main_module_index != 9) return;
+
+  // P1 must be synced first
+  PlayerState_SetCurrent(0);
+  PlayerState_SyncFromRam();
+
+  // Now init P2 based on P1's state
+  PlayerState_Init(1);
+  g_mp_initialized = true;
+  printf("Multiplayer: P2 initialized at (%d, %d)\n",
+         g_players[1].x_coord, g_players[1].y_coord);
+}
+
+// Run the multiplayer game loop: P1 full update, then P2 Link_Main only
+static void ZeldaRunGameLoop_Multiplayer(uint16 p2_input) {
+  frame_counter++;
+  ClearOamBuffer();
+
+  // Ensure P2 is initialized when gameplay starts
+  Multiplayer_InitIfNeeded();
+
+  // === P1 update (full game loop) ===
+  PlayerState_SetCurrent(0);
+  PlayerState_SyncToRam();
+
+  Module_MainRouting();
+  NMI_PrepareSprites();
+
+  // Sync back any changes the game loop made to g_ram
+  PlayerState_SyncFromRam();
+
+  // === P2 update (Link_Main only — world state already updated) ===
+  // Only update P2 during actual gameplay modules (7=dungeon, 9=overworld)
+  // Skip during cutscenes, menus, transitions, etc.
+  if (g_mp_initialized && g_players[1].is_active &&
+      (main_module_index == 7 || main_module_index == 9)) {
+    PlayerState_SetCurrent(1);
+    PlayerState_SyncToRam();
+
+    // Process P2 input into the per-player joypad globals
+    Multiplayer_ProcessP2Input(p2_input);
+
+    // During cutscenes (submodule != 0 in certain cases), lock P2 controls
+    // just like P1 is locked. The existing Link_Main handles this via
+    // player_handler_state and submodule_index checks.
+    Link_Main();
+
+    // Check sprite collisions against P2
+    // Sprites already ran during Module_MainRouting (against P1).
+    // Now check if any active sprite overlaps P2 and apply damage.
+    Multiplayer_CheckSpriteDamageToP2();
+
+    // Draw P2's hearts as OAM sprites at bottom of screen
+    Multiplayer_DrawP2Hud();
+
+    // Draw P2's sprite into separate OAM slots
+    // Save the global sort settings, override for P2
+    uint16 saved_sort_offset = sort_sprites_offset_into_oam_buffer;
+    uint8 saved_sort_setting = (uint8)sort_sprites_setting;
+    sort_sprites_setting = 0; // will cause LinkOam_Main to set offset to 0x190
+    LinkOam_Main();
+    // Override: move P2's OAM to dedicated slots (0x40 = slot 16)
+    // Since LinkOam_Main wrote to offset 0x190 area, we relocate
+    // Actually, just let P2 use the 0x190 offset since P1 may use 0xe0
+    // Restore P1's settings
+    sort_sprites_offset_into_oam_buffer = saved_sort_offset;
+    sort_sprites_setting = saved_sort_setting;
+
+    // Sync P2's state back from g_ram
+    PlayerState_SyncFromRam();
+
+    // Restore P1 as current (for systems that read cur_player outside the loop)
+    PlayerState_SetCurrent(0);
+    PlayerState_SyncToRam();
+
+    // Handle P2 death/respawn
+    Multiplayer_HandleP2Death();
+
+    // === Shared camera: center between both players ===
+    Multiplayer_UpdateCamera();
+  }
+
+  // Check for screen transitions and warp P2
+  if (g_mp_initialized)
+    Multiplayer_WarpP2OnTransition();
+
+  nmi_boolean = 0;
+}
+
+#define MP_MAX_LEASH_DISTANCE 200  // max pixel distance before P2 is clamped
+
+// Draw P2's health as OAM sprites at the bottom of the screen.
+// Uses a simple row of heart tiles from the HUD character set.
+// cur_player must be P2 when called.
+static void Multiplayer_DrawP2Hud(void) {
+  // Draw hearts as OAM sprites at bottom-right of screen
+  // Heart tiles: 0x24 = full, 0x25 = half, 0x26 = empty
+  // Use OAM slots near the end to avoid conflicts
+  int max_hearts = cur_player->health_capacity >> 3;  // capacity is in 1/8 hearts
+  int cur_health = cur_player->health_current;
+  if (max_hearts > 20) max_hearts = 20;
+
+  int base_x = 176;  // bottom-right area
+  int base_y = 208;  // near bottom of screen
+  int oam_idx = 120;  // use high OAM slots (120-127)
+
+  for (int i = 0; i < max_hearts && oam_idx < 128; i++) {
+    int x = base_x + (i % 10) * 8;
+    int y = base_y + (i / 10) * 8;
+    uint8 charnum;
+    int hp_for_heart = cur_health - i * 8;
+    if (hp_for_heart >= 8)
+      charnum = 0x24;  // full heart
+    else if (hp_for_heart >= 4)
+      charnum = 0x25;  // half heart
+    else
+      charnum = 0x26;  // empty heart
+    // palette 5 (P2 color), priority 2
+    SetOamPlain(&oam_buf[oam_idx], x, y, charnum, 0x2A, 0);
+    oam_idx++;
+  }
+}
+
+// Handle P2 death and respawn. Called each frame when P2 is active.
+// cur_player must be P2 when called.
+static void Multiplayer_HandleP2Death(void) {
+  PlayerState *p2 = &g_players[1];
+  PlayerState *p1 = &g_players[0];
+
+  // Check if P2 just died (health reached 0)
+  if (p2->health_current == 0 && !p2->is_dead) {
+    p2->is_dead = 1;
+    p2->is_ghost = 1;
+    p2->respawn_timer = 255;  // ~4.25 seconds at 60fps (max uint8)
+    p2->visibility_status = 0x12;  // make translucent
+  }
+
+  if (p2->is_dead) {
+    if (p2->respawn_timer > 0) {
+      p2->respawn_timer--;
+    } else {
+      // Respawn at P1's position
+      p2->x_coord = p1->x_coord + 16;
+      p2->y_coord = p1->y_coord;
+      p2->health_current = p2->health_capacity;
+      p2->is_dead = 0;
+      p2->is_ghost = 0;
+      p2->visibility_status = 0;
+      p2->disable_sprite_damage = 0;
+      // Brief invincibility after respawn
+    }
+  }
+
+  // Ghost state: no collision, translucent
+  if (p2->is_ghost) {
+    p2->disable_sprite_damage = 1;
+  }
+}
+
+// Warp P2 to P1 during screen transitions.
+// Called during the multiplayer game loop to detect transitions.
+static uint8 g_last_module_index = 0;
+static uint8 g_last_submodule_index = 0;
+static void Multiplayer_WarpP2OnTransition(void) {
+  // Detect module changes (screen transitions)
+  // Module 7 = dungeon, 9 = overworld
+  // When the main module changes, or submodule indicates a transition,
+  // teleport P2 to P1's position.
+  uint8 cur_module = main_module_index;
+  uint8 cur_submodule = submodule_index;
+
+  bool is_transition = false;
+  if (cur_module != g_last_module_index)
+    is_transition = true;
+  // Dungeon room transitions (module 7, submodule changes from 0 to nonzero)
+  if (cur_module == 7 && cur_submodule != 0 && g_last_submodule_index == 0)
+    is_transition = true;
+  // Overworld scroll transitions
+  if (cur_module == 9 && cur_submodule != 0 && g_last_submodule_index == 0)
+    is_transition = true;
+
+  if (is_transition && g_players[1].is_active) {
+    PlayerState *p1 = &g_players[0];
+    PlayerState *p2 = &g_players[1];
+    p2->x_coord = p1->x_coord + 16;
+    p2->y_coord = p1->y_coord;
+    p2->is_on_lower_level = p1->is_on_lower_level;
+    // FUTURE: Multiplayer_HandleIndependentTransition()
+  }
+
+  g_last_module_index = cur_module;
+  g_last_submodule_index = cur_submodule;
+}
+
+static void Multiplayer_UpdateCamera(void) {
+  PlayerState *p1 = &g_players[0];
+  PlayerState *p2 = &g_players[1];
+
+  // Calculate midpoint between both players
+  int mid_x = ((int)p1->x_coord + (int)p2->x_coord) / 2;
+  int mid_y = ((int)p1->y_coord + (int)p2->y_coord) / 2;
+
+  // Calculate distance
+  int dx = (int)p2->x_coord - (int)p1->x_coord;
+  int dy = (int)p2->y_coord - (int)p1->y_coord;
+
+  // If players are far apart, bias camera toward P1 and clamp P2
+  if (dx > MP_MAX_LEASH_DISTANCE) {
+    p2->x_coord = p1->x_coord + MP_MAX_LEASH_DISTANCE;
+    mid_x = (int)p1->x_coord + MP_MAX_LEASH_DISTANCE / 2;
+  } else if (dx < -MP_MAX_LEASH_DISTANCE) {
+    p2->x_coord = p1->x_coord - MP_MAX_LEASH_DISTANCE;
+    mid_x = (int)p1->x_coord - MP_MAX_LEASH_DISTANCE / 2;
+  }
+  if (dy > MP_MAX_LEASH_DISTANCE) {
+    p2->y_coord = p1->y_coord + MP_MAX_LEASH_DISTANCE;
+    mid_y = (int)p1->y_coord + MP_MAX_LEASH_DISTANCE / 2;
+  } else if (dy < -MP_MAX_LEASH_DISTANCE) {
+    p2->y_coord = p1->y_coord - MP_MAX_LEASH_DISTANCE;
+    mid_y = (int)p1->y_coord - MP_MAX_LEASH_DISTANCE / 2;
+  }
+
+  // Adjust camera scroll: shift BG2 scroll to center on the midpoint
+  // The camera normally centers on P1 at offset (128, 112) from top-left
+  // We want to shift the camera by the delta between midpoint and P1
+  int shift_x = mid_x - (int)p1->x_coord;
+  int shift_y = mid_y - (int)p1->y_coord;
+
+  BG2HOFS_copy2 += shift_x;
+  BG2VOFS_copy2 += shift_y;
+  BG2HOFS_copy += shift_x;
+  BG2VOFS_copy += shift_y;
+
+  // Also shift BG1 to keep layers aligned
+  BG1HOFS_copy2 += shift_x;
+  BG1VOFS_copy2 += shift_y;
+  BG1HOFS_copy += shift_x;
+  BG1VOFS_copy += shift_y;
+}
+#endif // ZELDA3_MULTIPLAYER
+
 void ZeldaInitialize() {
   g_zenv.dma = dma_init(NULL);
   g_zenv.ppu = ppu_init(NULL);
@@ -272,6 +572,11 @@ void ZeldaInitialize() {
   SpcPlayer_Initialize(g_zenv.player);
   dma_reset(g_zenv.dma);
   ppu_reset(g_zenv.ppu);
+#ifdef ZELDA3_MULTIPLAYER
+  // Initialize P1 player state
+  PlayerState_Init(0);
+  g_mp_initialized = false;
+#endif
 }
 
 static void ZeldaRunPolyLoop() {
@@ -288,8 +593,14 @@ void ZeldaRunFrameInternal(uint16 input, int run_what) {
 
   if (run_what & 2)
     ZeldaRunPolyLoop();
-  if (run_what & 1)
+  if (run_what & 1) {
+#ifdef ZELDA3_MULTIPLAYER
+    if (g_mp_config.mode == MP_MODE_LOCAL)
+      ZeldaRunGameLoop_Multiplayer(g_p2_input_this_frame);
+    else
+#endif
     ZeldaRunGameLoop();
+  }
   Interrupt_NMI(input);
 }
 
@@ -684,11 +995,20 @@ int InputStateReadFromFile() {
 }
 #endif
 
+#ifdef ZELDA3_MULTIPLAYER
+bool ZeldaRunFrame(int inputs, int inputs_p2) {
+#else
 bool ZeldaRunFrame(int inputs) {
+#endif
 
   // Avoid up/down and left/right from being pressed at the same time
   if ((inputs & 0x30) == 0x30) inputs ^= 0x30;
   if ((inputs & 0xc0) == 0xc0) inputs ^= 0xc0;
+
+#ifdef ZELDA3_MULTIPLAYER
+  // Store P2 input for use in the multiplayer game loop
+  g_p2_input_this_frame = (uint16)inputs_p2;
+#endif
 
   frame_ctr_dbg++;
 

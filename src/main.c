@@ -26,6 +26,9 @@
 #include "load_gfx.h"
 #include "util.h"
 #include "audio.h"
+#ifdef ZELDA3_MULTIPLAYER
+#include "player_state.h"
+#endif
 
 static bool g_run_without_emu = 0;
 
@@ -39,6 +42,9 @@ static int RemapSdlButton(int button);
 static void HandleGamepadInput(int button, bool pressed);
 static void HandleGamepadAxisInput(int gamepad_id, int axis, int value);
 static void OpenOneGamepad(int i);
+#ifdef ZELDA3_MULTIPLAYER
+static void HandleGamepadInput_Player(int player, int button, bool pressed);
+#endif
 static void HandleVolumeAdjustment(int volume_adjustment);
 static void LoadAssets();
 static void SwitchDirectory();
@@ -67,6 +73,64 @@ static int g_sdl_audio_mixer_volume = SDL_MIX_MAXVOLUME;
 static struct RendererFuncs g_renderer_funcs;
 static uint32 g_gamepad_modifiers;
 static uint16 g_gamepad_last_cmd[kGamepadBtn_Count];
+
+#ifdef ZELDA3_MULTIPLAYER
+// Per-controller state for multiplayer
+#define MAX_SDL_CONTROLLERS 4
+static SDL_GameController *g_controllers[MAX_SDL_CONTROLLERS];
+static SDL_JoystickID g_controller_joy_ids[MAX_SDL_CONTROLLERS]; // joystick instance IDs
+static int g_num_controllers = 0;
+
+// Per-player input state
+static int g_player_input_state[2];        // keyboard input per player
+static uint8 g_player_gamepad_buttons[2];  // gamepad dpad/axis per player
+static uint32 g_player_gamepad_modifiers[2];
+static uint16 g_player_gamepad_last_cmd[2][kGamepadBtn_Count];
+
+// Map a joystick instance ID to a player index (0 or 1)
+static int GetPlayerForController(SDL_JoystickID joy_id) {
+  // Controllers are assigned in order: first controller = P1, second = P2
+  for (int i = 0; i < g_num_controllers && i < 2; i++) {
+    if (g_controller_joy_ids[i] == joy_id)
+      return i;
+  }
+  return 0; // default to P1
+}
+
+// P2 keyboard mapping: Arrow keys + numpad
+static int HandleP2KeyInput(int keyCode, bool pressed) {
+  int bit = -1;
+  switch (keyCode) {
+    // B=Numpad1, Y=Numpad2, Select=Numpad3, Start=Numpad Enter
+    // Up=UpArrow, Down=DownArrow, Left=LeftArrow, Right=RightArrow
+    // A=Numpad5, X=Numpad4, L=Numpad7, R=Numpad8
+    case SDLK_KP_1:     bit = 0; break;  // B
+    case SDLK_KP_5:     bit = 1; break;  // A (mapped via kKbdRemap)
+    case SDLK_KP_3:     bit = 2; break;  // Select
+    case SDLK_KP_ENTER: bit = 3; break;  // Start
+    case SDLK_UP:       bit = 4; break;  // Up
+    case SDLK_DOWN:     bit = 5; break;  // Down
+    case SDLK_LEFT:     bit = 6; break;  // Left
+    case SDLK_RIGHT:    bit = 7; break;  // Right
+    case SDLK_KP_4:     bit = 8; break;  // Y
+    case SDLK_KP_2:     bit = 9; break;  // X
+    case SDLK_KP_7:     bit = 10; break; // L
+    case SDLK_KP_8:     bit = 11; break; // R
+    default: return 0;
+  }
+  // Use same remap as P1
+  static const uint8 kKbdRemap[] = { 0, 4, 5, 6, 7, 2, 3, 8, 0, 9, 1, 10, 11 };
+  if (bit >= 0 && bit <= 11) {
+    int mapped = kKbdRemap[bit + 1]; // +1 because kKbdRemap[0] is null entry
+    if (pressed)
+      g_player_input_state[1] |= 1 << mapped;
+    else
+      g_player_input_state[1] &= ~(1 << mapped);
+    return 1;
+  }
+  return 0;
+}
+#endif // ZELDA3_MULTIPLAYER
 
 void NORETURN Die(const char *error) {
 #if defined(NDEBUG) && defined(_WIN32)
@@ -387,6 +451,18 @@ int main(int argc, char** argv) {
 
   ZeldaReadSram();
 
+#ifdef ZELDA3_MULTIPLAYER
+  // Initialize multiplayer in local co-op mode
+  g_mp_config.mode = MP_MODE_LOCAL;
+  g_mp_config.num_players = 2;
+  g_mp_config.local_player_index = 0;
+  g_mp_config.input_delay_frames = 0;
+  memset(g_player_input_state, 0, sizeof(g_player_input_state));
+  memset(g_player_gamepad_buttons, 0, sizeof(g_player_gamepad_buttons));
+  memset(g_player_gamepad_modifiers, 0, sizeof(g_player_gamepad_modifiers));
+  memset(g_player_gamepad_last_cmd, 0, sizeof(g_player_gamepad_last_cmd));
+#endif
+
   for (int i = 0; i < SDL_NumJoysticks(); i++)
     OpenOneGamepad(i);
 
@@ -412,8 +488,15 @@ int main(int argc, char** argv) {
       case SDL_CONTROLLERBUTTONDOWN:
       case SDL_CONTROLLERBUTTONUP: {
         int b = RemapSdlButton(event.cbutton.button);
-        if (b >= 0)
+        if (b >= 0) {
+#ifdef ZELDA3_MULTIPLAYER
+          if (g_mp_config.mode == MP_MODE_LOCAL) {
+            int player = GetPlayerForController(event.cbutton.which);
+            HandleGamepadInput_Player(player, b, event.type == SDL_CONTROLLERBUTTONDOWN);
+          } else
+#endif
           HandleGamepadInput(b, event.type == SDL_CONTROLLERBUTTONDOWN);
+        }
         break;
       }
       case SDL_MOUSEWHEEL:
@@ -429,9 +512,17 @@ int main(int argc, char** argv) {
         }
         break;
       case SDL_KEYDOWN:
+#ifdef ZELDA3_MULTIPLAYER
+        if (g_mp_config.mode == MP_MODE_LOCAL && HandleP2KeyInput(event.key.keysym.sym, true))
+          break;
+#endif
         HandleInput(event.key.keysym.sym, event.key.keysym.mod, true);
         break;
       case SDL_KEYUP:
+#ifdef ZELDA3_MULTIPLAYER
+        if (g_mp_config.mode == MP_MODE_LOCAL && HandleP2KeyInput(event.key.keysym.sym, false))
+          break;
+#endif
         HandleInput(event.key.keysym.sym, event.key.keysym.mod, false);
         break;
       case SDL_QUIT:
@@ -457,8 +548,25 @@ int main(int argc, char** argv) {
       g_gamepad_buttons = 0;
     inputs |= g_gamepad_buttons;
 
+#ifdef ZELDA3_MULTIPLAYER
+    int inputs_p2 = 0;
+    if (g_mp_config.mode == MP_MODE_LOCAL) {
+      inputs_p2 = g_player_input_state[1];
+      if (g_player_input_state[1] & 0xf0)
+        g_player_gamepad_buttons[1] = 0;
+      inputs_p2 |= g_player_gamepad_buttons[1];
+      // Avoid conflicting directions for P2
+      if ((inputs_p2 & 0x30) == 0x30) inputs_p2 ^= 0x30;
+      if ((inputs_p2 & 0xc0) == 0xc0) inputs_p2 ^= 0xc0;
+    }
+#endif
+
     SDL_LockMutex(g_audio_mutex);
+#ifdef ZELDA3_MULTIPLAYER
+    bool is_replay = ZeldaRunFrame(inputs, inputs_p2);
+#else
     bool is_replay = ZeldaRunFrame(inputs);
+#endif
     SDL_UnlockMutex(g_audio_mutex);
 
     frameCtr++;
@@ -658,8 +766,19 @@ static void HandleInput(int keyCode, int keyMod, bool pressed) {
 static void OpenOneGamepad(int i) {
   if (SDL_IsGameController(i)) {
     SDL_GameController *controller = SDL_GameControllerOpen(i);
-    if (!controller)
+    if (!controller) {
       fprintf(stderr, "Could not open gamepad %d: %s\n", i, SDL_GetError());
+      return;
+    }
+#ifdef ZELDA3_MULTIPLAYER
+    if (g_num_controllers < MAX_SDL_CONTROLLERS) {
+      SDL_Joystick *joy = SDL_GameControllerGetJoystick(controller);
+      g_controllers[g_num_controllers] = controller;
+      g_controller_joy_ids[g_num_controllers] = SDL_JoystickInstanceID(joy);
+      g_num_controllers++;
+      printf("Controller %d assigned to Player %d\n", i, g_num_controllers <= 2 ? g_num_controllers : 0);
+    }
+#endif
   }
 }
 
@@ -693,6 +812,35 @@ static void HandleGamepadInput(int button, bool pressed) {
   if (g_gamepad_last_cmd[button] != 0)
     HandleCommand(g_gamepad_last_cmd[button], pressed);
 }
+
+#ifdef ZELDA3_MULTIPLAYER
+static void HandleGamepadInput_Player(int player, int button, bool pressed) {
+  if (player < 0 || player > 1) return;
+  if (!!(g_player_gamepad_modifiers[player] & (1 << button)) == pressed)
+    return;
+  g_player_gamepad_modifiers[player] ^= 1 << button;
+  if (player == 0) {
+    // P1: route through existing command system
+    if (pressed)
+      g_player_gamepad_last_cmd[player][button] = FindCmdForGamepadButton(button, g_player_gamepad_modifiers[player]);
+    if (g_player_gamepad_last_cmd[player][button] != 0)
+      HandleCommand(g_player_gamepad_last_cmd[player][button], pressed);
+  } else {
+    // P2: directly set input bits (same mapping as P1 controls)
+    if (pressed)
+      g_player_gamepad_last_cmd[player][button] = FindCmdForGamepadButton(button, g_player_gamepad_modifiers[player]);
+    uint16 cmd = g_player_gamepad_last_cmd[player][button];
+    if (cmd >= kKeys_Controls && cmd <= kKeys_Controls_Last) {
+      static const uint8 kKbdRemap[] = { 0, 4, 5, 6, 7, 2, 3, 8, 0, 9, 1, 10, 11 };
+      int j = cmd - kKeys_Controls;
+      if (pressed)
+        g_player_input_state[1] |= 1 << kKbdRemap[j];
+      else
+        g_player_input_state[1] &= ~(1 << kKbdRemap[j]);
+    }
+  }
+}
+#endif
 
 static void HandleVolumeAdjustment(int volume_adjustment) {
 #if SYSTEM_VOLUME_MIXER_AVAILABLE
@@ -729,6 +877,32 @@ static float ApproximateAtan2(float y, float x) {
 
 static void HandleGamepadAxisInput(int gamepad_id, int axis, int value) {
   static int last_gamepad_id, last_x, last_y;
+#ifdef ZELDA3_MULTIPLAYER
+  if (g_mp_config.mode == MP_MODE_LOCAL) {
+    int player = GetPlayerForController(gamepad_id);
+    static int mp_last_x[2], mp_last_y[2];
+    if (axis == SDL_CONTROLLER_AXIS_LEFTX || axis == SDL_CONTROLLER_AXIS_LEFTY) {
+      *(axis == SDL_CONTROLLER_AXIS_LEFTX ? &mp_last_x[player] : &mp_last_y[player]) = value;
+      int buttons = 0;
+      int lx = mp_last_x[player], ly = mp_last_y[player];
+      if (lx * lx + ly * ly >= 10000 * 10000) {
+        static const uint8 kSegmentToButtons[8] = {
+          1 << 4, 1 << 4 | 1 << 7, 1 << 7, 1 << 7 | 1 << 5,
+          1 << 5, 1 << 5 | 1 << 6, 1 << 6, 1 << 6 | 1 << 4,
+        };
+        uint8 angle = (uint8)(int)(ApproximateAtan2(ly, lx) * 64.0f + 0.5f);
+        buttons = kSegmentToButtons[(uint8)(angle + 16 + 64) >> 5];
+      }
+      g_player_gamepad_buttons[player] = buttons;
+      if (player == 0)
+        g_gamepad_buttons = buttons;
+    } else if (axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) {
+      if (value < 12000 || value >= 16000)
+        HandleGamepadInput_Player(player, axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT ? kGamepadBtn_L2 : kGamepadBtn_R2, value >= 12000);
+    }
+    return;
+  }
+#endif
   if (axis == SDL_CONTROLLER_AXIS_LEFTX || axis == SDL_CONTROLLER_AXIS_LEFTY) {
     // ignore other gamepads unless they have a big input
     if (last_gamepad_id != gamepad_id) {

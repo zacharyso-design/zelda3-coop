@@ -1526,5 +1526,5 @@ extern const uint8 kDungeonCrystalPendantBit[];
 extern const int8 kGetBestActionToPerformOnTile_x[];
 extern const int8 kGetBestActionToPerformOnTile_y[];
 
-
+#include "player_state_macros.h"
 #endif  // ZELDA3_VARIABLES_H_

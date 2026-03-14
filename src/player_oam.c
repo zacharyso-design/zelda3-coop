@@ -927,6 +927,11 @@ continue_after_set:
   int r4loc = kPlayerOamSpriteLocs[r2];
 
   link_palette_bits_of_oam = palette_swap_flag ? 0 : 0xe00;
+#ifdef ZELDA3_MULTIPLAYER
+  // P2 uses a different palette (palette 5 = purple/red tunic)
+  if (cur_player->player_index == 1 && !palette_swap_flag)
+    link_palette_bits_of_oam = 0xa00;
+#endif
   link_dma_var1 = link_dma_var2 = 0;
 
   int xt = FindInByteArray(kPlayerOam_Tab5, yt, 7);
